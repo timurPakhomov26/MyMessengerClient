@@ -44,6 +44,7 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     connect(sendBtn, &QPushButton::clicked, this, &ChatClient::sendMessage);
     connect(m_socket, &QTcpSocket::readyRead, this, &ChatClient::onReadyRead);
     connect(m_socket, &QTcpSocket::connected, this, &ChatClient::onConnected);
+    connect(m_messageEdit, &QLineEdit::returnPressed, this, &ChatClient::sendMessage);
 
     // Магия: кликаем на ник в списке — он летит в поле "Кому"
     connect(m_userListWidget, &QListWidget::itemClicked, [this](QListWidgetItem *item){
@@ -68,5 +69,26 @@ void ChatClient::sendMessage() {
 }
 
 void ChatClient::onReadyRead() {
-    m_chatArea->append(QString::fromUtf8(m_socket->readAll()));
+    QByteArray data = m_socket->readAll();
+    QString message = QString::fromUtf8(data).trimmed();
+
+    // ПРОВЕРКА: Если сообщение начинается с нашего спец-кода "USERS_LIST:"
+    if (message.startsWith("USERS_LIST:")) {
+        // Отрезаем приставку "USERS_LIST:" (это 11 символов)
+        QString list = message.mid(11);
+
+
+        QStringList users = list.split(",");
+
+        // Обновляем виджет справа
+        m_userListWidget->clear();        // Стираем старое
+        m_userListWidget->addItems(users); // Закидываем новые ники
+
+        m_chatArea->moveCursor(QTextCursor::End);
+
+        return; // Выходим из функции, чтобы эта системная строка не попала в чат
+    }
+
+    // Если это не список пользователей, значит это просто сообщение
+    m_chatArea->append(message);
 }
