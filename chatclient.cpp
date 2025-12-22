@@ -1,6 +1,7 @@
 #include "chatclient.h"
 #include <QVBoxLayout>
 #include <QLabel>
+#include <QDateTime>
 
 ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     m_socket = new QTcpSocket(this);
@@ -62,33 +63,67 @@ void ChatClient::onConnected() {
 }
 
 void ChatClient::sendMessage() {
-    QString data = m_targetName->text() + ":" + m_messageEdit->text();
-    m_socket->write(data.toUtf8());
-    m_chatArea->append("Вы: " + m_messageEdit->text());
-    m_messageEdit->clear();
-}
+    QString text = m_messageEdit->text().trimmed();
 
-void ChatClient::onReadyRead() {
-    QByteArray data = m_socket->readAll();
-    QString message = QString::fromUtf8(data).trimmed();
+    if (text.isEmpty()) return;
 
-    // ПРОВЕРКА: Если сообщение начинается с нашего спец-кода "USERS_LIST:"
-    if (message.startsWith("USERS_LIST:")) {
-        // Отрезаем приставку "USERS_LIST:" (это 11 символов)
-        QString list = message.mid(11);
+    // 2. ПРОВЕРКА: Это команда (начинается с /) или обычное сообщение?
+    if (text.startsWith("/")) {
 
+        m_socket->write(text.toUtf8());
 
-        QStringList users = list.split(",");
+        m_chatArea->append("<i style='color:gray;'>Отправка команды: " + text + "</i>");
+    }
+    else {
+        QString target = m_targetName->text().trimmed();
 
-        // Обновляем виджет справа
-        m_userListWidget->clear();        // Стираем старое
-        m_userListWidget->addItems(users); // Закидываем новые ники
+        if (target.isEmpty()) {
+            m_chatArea->append("<b style='color:red;'>Система: Выберите получателя в списке справа!</b>");
+            return;
+        }
 
-        m_chatArea->moveCursor(QTextCursor::End);
+        QString data = target + ":" + text;
+        m_socket->write(data.toUtf8());
 
-        return; // Выходим из функции, чтобы эта системная строка не попала в чат
+        // Добавляем в свое окно чата
+        QString time = QDateTime::currentDateTime().toString("hh:mm");
+        m_chatArea->append(QString("<span style='color:gray;'>[%1]</span> <b style='color:green;'>Вы:</b> %2")
+                               .arg(time, text));
     }
 
-    // Если это не список пользователей, значит это просто сообщение
-    m_chatArea->append(message);
+    // 3. Очищаем поле ввода и возвращаем фокус на него
+    m_messageEdit->clear();
+    m_chatArea->moveCursor(QTextCursor::End);
+}
+
+void ChatClient::onReadyRead()
+{
+    QByteArray allData = m_socket->readAll();//байты которые идут с сервака
+
+    // . Превращаем байты в текст и рубим на строки по символу '\n'
+    QStringList lines = QString::fromUtf8(allData).split('\n', Qt::SkipEmptyParts);
+
+    for (const QString &line : lines)
+    {
+        QString message = line.trimmed();
+        if (message.isEmpty()) continue;
+
+        // --- ЛОГИКА ОБРАБОТКИ СПИСКА ПОЛЬЗОВАТЕЛЕЙ ---
+        if (message.startsWith("USERS_LIST:")) {
+            // Отрезаем префикс "USERS_LIST:"
+            QString list = message.mid(11);
+            // Разбиваем "user1,user2" на список имен
+            QStringList users = list.split(',', Qt::SkipEmptyParts);
+
+            // Обновляем виджет списка на панели справа
+            m_userListWidget->clear();
+            m_userListWidget->addItems(users);
+        }
+        else
+        {
+            m_chatArea->append(message);
+        }
+    }
+
+    m_chatArea->moveCursor(QTextCursor::End);
 }
