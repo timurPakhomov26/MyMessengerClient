@@ -65,7 +65,7 @@ private:
     QPushButton *m_voiceButton;
     QPushButton *m_voiceChatButton;
     QPushButton *m_headsetButton;
-    int m_voiceThreshold = 3000;
+    int m_voiceThreshold = 1500;
 
     QUdpSocket *m_udpSocket;
 };

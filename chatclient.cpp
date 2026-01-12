@@ -175,6 +175,8 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
 
     // m_inputDevice = m_audioSource->start();
     m_inputDevice = m_audioSource->start();
+    m_audioSource->setBufferSize(1600);
+    m_audioSink->setBufferSize(1600);
     if (!m_inputDevice) {
         qDebug() << "КРИТИЧЕСКАЯ ОШИБКА: Микрофон не запустился!";
         return;
@@ -309,12 +311,12 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     m_udpSocket = new QUdpSocket(this);
     // Биндим на тот же порт 1235, чтобы ловить ответ от сервера
     m_udpSocket->bind(QHostAddress::AnyIPv4, 1235, QUdpSocket::ShareAddress);
-
+    m_udpSocket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     connect(m_udpSocket, &QUdpSocket::readyRead, this, [this](){
         while (m_udpSocket->hasPendingDatagrams()) {
             QByteArray data = m_udpSocket->receiveDatagram().data();
             if (!m_isDeaf && m_outputDevice) {
-                m_outputDevice->write(data); // СРАЗУ В ДИНАМИК
+                m_outputDevice->write(data);
             }
         }
     });
@@ -479,7 +481,7 @@ void ChatClient::onReadyRead() {
     if (rawData.contains("VOICE_DATA:")) {
         int idx = rawData.indexOf("VOICE_DATA:");
         if (!m_isDeaf && m_outputDevice) {
-            m_outputDevice->write(rawData.mid(idx + 11)); // Шлем в уши
+            m_outputDevice->write(rawData.mid(idx + 11));
         }
         return;
     }
