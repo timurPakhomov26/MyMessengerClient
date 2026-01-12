@@ -6,6 +6,7 @@
 #include <QSoundEffect>
 #include <QTextBrowser>
 #include <QCoreApplication>
+#include <QNetworkDatagram>
 
 ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     m_socket = new QTcpSocket(this);
@@ -22,12 +23,18 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     m_userListWidget->setMaximumWidth(150);
 
     m_myUserName = new QLineEdit(this);
+    m_myUserName->setPlaceholderText("Login...");
+
+    m_passwordEdit = new QLineEdit(this);
+    m_passwordEdit->setPlaceholderText("Password...");
+    m_passwordEdit->setEchoMode(QLineEdit::Password); // Чтобы вместо букв были точки!
+
     m_targetName = new QLineEdit(this);
     m_messageEdit = new QLineEdit(this);
     m_attachButton = new QPushButton("📎", this);
 
-    QPushButton *connBtn = new QPushButton("Войти", this);
-    QPushButton *sendBtn = new QPushButton("Отправить", this);
+    connBtn = new QPushButton("Войти", this);
+    sendBtn = new QPushButton("Отправить", this);
 
     // --- РАСПОЛОЖЕНИЕ (LAYOUT) ---
 
@@ -36,6 +43,7 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
 
     leftLayout->addWidget(new QLabel("Ваш ник:"));
     leftLayout->addWidget(m_myUserName);
+    leftLayout->addWidget(m_passwordEdit);
     leftLayout->addWidget(connBtn);
     leftLayout->addWidget(m_chatArea);
     leftLayout->addWidget(new QLabel("Кому (кликните в списке справа):"));
@@ -47,8 +55,10 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     QHBoxLayout *mainLayout = new QHBoxLayout(this);
     mainLayout->addLayout(leftLayout);
     mainLayout->addWidget(m_userListWidget);
-    mainLayout->addWidget(m_attachButton);
+    // mainLayout->addWidget(m_attachButton);
 
+    //mainLayout->addWidget(m_myUserName);
+    // mainLayout->addWidget(m_passwordEdit);
     setLayout(mainLayout); // Устанавливаем итоговый слой на окно
 
     // --- СИГНАЛЫ И СЛОТЫ ---
@@ -67,6 +77,7 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
 
 
     leftLayout->addWidget(m_micButton);
+    leftLayout->addWidget(m_attachButton);
 
     connect(m_micButton, &QPushButton::pressed, this, &ChatClient::startRecording);
     connect(m_micButton, &QPushButton::released, this, &ChatClient::stopRecording);
@@ -76,31 +87,45 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
     m_chatArea->setTextInteractionFlags(Qt::TextBrowserInteraction);
     m_chatArea->setReadOnly(true);
 
+    // --- НАСТРОЙКА АУДИО-ДВИЖКА 2026 ---
+    QAudioFormat format;
+    format.setSampleRate(8000); // Низкая частота для рации, чтобы не лагало
+    format.setChannelCount(1);
+    format.setSampleFormat(QAudioFormat::Int16); // 16 бит - стандарт
+
+    // Создаем сами объекты (микрофон и динамик)
+    m_audioSource = new QAudioSource(format, this);
+    m_audioSink = new QAudioSink(format, this);
+
+    // Сразу готовим динамик к приему байтов
+    m_outputDevice = m_audioSink->start();
+
     connect(m_chatArea, &QTextBrowser::anchorClicked, [this](const QUrl &url){
         QString link = url.toString();
-
         if (link.startsWith("play:")) {
-            // Вырезаем имя файла (все что после "play:")
             QString fileName = link.mid(5);
-
-            // Формируем полный путь к папке, где запущен мессенджер
             QString fullPath = QCoreApplication::applicationDirPath() + "/" + fileName;
 
-            qDebug() << "Попытка воспроизведения:" << fullPath;
+            if (m_currentPlayer && m_currentPlayer->isPlaying()) {
+                m_currentPlayer->stop();
 
+                // Если нажали на ту же самую запись, что играет сейчас — просто стопаем и выходим (как пауза)
+                if (m_lastPlayedFile == fileName) {
+                    m_lastPlayedFile = "";
+                    return;
+                }
+            }
+
+            // 2. Запускаем новую запись
             if (QFile::exists(fullPath)) {
-                QSoundEffect *player = new QSoundEffect(this);
-                player->setSource(QUrl::fromLocalFile(fullPath));
-                player->setVolume(1.0f);
+                if (!m_currentPlayer) m_currentPlayer = new QSoundEffect(this);
 
-                // Удаляем объект плеера после завершения звука (чтобы не жрать память)
-                connect(player, &QSoundEffect::playingChanged, [player](){
-                    if (!player->isPlaying()) player->deleteLater();
-                });
+                m_currentPlayer->setSource(QUrl::fromLocalFile(fullPath));
+                m_currentPlayer->setVolume(1.0f);
+                m_currentPlayer->play();
 
-                player->play();
-            } else {
-                qDebug() << "ОШИБКА: Файл не найден по пути:" << fullPath;
+                m_lastPlayedFile = fileName; // Запоминаем, что играет
+                qDebug() << "Играю:" << fileName;
             }
         }
     });
@@ -108,19 +133,193 @@ ChatClient::ChatClient(QWidget *parent) : QWidget(parent) {
 
     connect(m_userListWidget, &QListWidget::itemClicked, [this](QListWidgetItem *item)
             {
-                QString sender = item->text().section(" [", 0, 0); // Достаем чистое имя
-                m_unreadCounts[sender] = 0;
+        QString fullText = item->text();
+        m_chatArea->clear();
 
-                item->setBackground(Qt::transparent);
-                item->setForeground(Qt::black);
-                item->setText(sender);
+        if (fullText.contains("ОБЩИЙ")) {
+            m_targetName->setText("ОБЩИЙ ЧАТ");
+            // СБРАСЫВАЕМ СЧЕТЧИК И ВИЗУАЛ СРАЗУ
+            m_unreadCounts["GROUP_CHAT"] = 0;
+            item->setBackground(Qt::transparent);
+            item->setForeground(QColor("#f1c40f"));
+            item->setText("📢 [ ОБЩИЙ ЧАТ ]"); // Убираем [1] из текста!
 
-                m_targetName->setText(sender);
-                m_chatArea->clear();
-                m_socket->write(QString("/get_history %1\n").arg(sender).toUtf8());
+            m_socket->write("/get_history GROUP_CHAT\n");
+        } else {
+            QString name = fullText.mid(2).section(" [", 0, 0).trimmed();
+            m_targetName->setText(name);
+            m_unreadCounts[name] = 0;
+            item->setBackground(Qt::transparent);
+            m_socket->write(QString("/get_history %1\n").arg(name).toUtf8());
+        }
             });
-}
 
+    connect(connBtn, &QPushButton::clicked, [this](){
+        QString user = m_myUserName->text().trimmed();
+        QString pass = m_passwordEdit->text().trimmed();
+
+
+        if (user.isEmpty() || pass.isEmpty()) {
+            m_chatArea->append("<b style='color:red;'>Введите и логин, и пароль!</b>");
+            return;
+        }
+
+        // Шлем на сервер спец-пакет
+        QString authData = QString("AUTH:%1:%2\n").arg(user).arg(pass);
+        qDebug() << "SENDING AUTH:" << authData.toUtf8();
+        m_socket->write(authData.toUtf8());
+        //m_chatArea->append("<i>Попытка входа...</i>");
+    });
+
+
+
+    // m_inputDevice = m_audioSource->start();
+    m_inputDevice = m_audioSource->start();
+    if (!m_inputDevice) {
+        qDebug() << "КРИТИЧЕСКАЯ ОШИБКА: Микрофон не запустился!";
+        return;
+    }
+    // connect(m_inputDevice, &QIODevice::readyRead, this,[this](){
+    //     QByteArray data = m_inputDevice->readAll();
+    //     if (m_isMuted || data.isEmpty()) return;
+
+    //     // СЧИТАЕМ ГРОМКОСТЬ (RMS - среднеквадратичное)
+    //     const int16_t *samples = reinterpret_cast<const int16_t*>(data.data());
+    //     int sampleCount = data.size() / sizeof(int16_t);
+    //     long long sum = 0;
+
+    //     for (int i = 0; i < sampleCount; ++i) {
+    //         sum += qAbs(samples[i]); // Складываем амплитуду всех звуковых волн
+    //     }
+
+    //     int averageVolume = (sampleCount > 0) ? (sum / sampleCount) : 0;
+
+    //     // ОТСЕЧКА: Шлем только если громче порога
+    //     if (averageVolume > m_voiceThreshold) {
+    //         m_socket->write("VOICE_DATA:" + data);
+    //         // qDebug() << "Голос активен, громкость:" << averageVolume;
+    //     } else {
+    //         // qDebug() << "Тишина... пропускаем";
+    //     }
+    // },Qt::UniqueConnection);
+
+    m_voiceButton = new QPushButton("🎙️ Микро: Вкл", this);
+    m_headsetButton = new QPushButton("🎧 Уши: Вкл", this);
+    leftLayout->addWidget(m_voiceButton);
+    // Добавляем их в интерфейс (например, в voiceLayout)
+    // voiceLayout->addWidget(m_micButton);
+    // voiceLayout->addWidget(m_headsetButton);
+
+    // --- ЛОГИКА КНОПКИ МИКРОФОНА ---
+
+    m_voiceChatButton = new QPushButton("🎤 Войти в Голос", this);
+    m_voiceChatButton->setCheckable(true); // Чтобы она фиксировалась в нажатом состоянии
+    m_voiceChatButton->setStyleSheet("background-color: #2d3436; color: white; font-weight: bold; padding: 10px;");
+     leftLayout->insertWidget(0, m_voiceChatButton);
+
+    connect(m_voiceChatButton, &QPushButton::clicked, [this](bool checked){
+        if (checked) {
+            // Запускаем микрофон, только если он остановлен
+            if (m_audioSource->state() == QAudio::StoppedState) {
+                m_inputDevice = m_audioSource->start();
+                if (m_inputDevice) {
+                    connect(m_inputDevice, &QIODevice::readyRead, this, [this](){
+                        if (!m_isMuted) {
+                            QByteArray data = m_inputDevice->readAll();
+                            if (m_isMuted || data.isEmpty()) return;
+
+                            // СЧИТАЕМ ГРОМКОСТЬ
+                            const int16_t *samples = reinterpret_cast<const int16_t*>(data.data());
+                            int sampleCount = data.size() / sizeof(int16_t);
+                            long long sum = 0;
+
+                            for (int i = 0; i < sampleCount; ++i) {
+                                sum += qAbs(samples[i]);
+                            }
+
+                            int averageVolume = (sampleCount > 0) ? (sum / sampleCount) : 0;
+
+                            // ВОТ ТУТ ИСПОЛЬЗУЕТСЯ ТВОЙ ПОРОГ
+                            if (averageVolume > m_voiceThreshold) {
+                                m_udpSocket->writeDatagram(data, QHostAddress("83.136.235.45"), 1235);
+                                // qDebug() << "Голос прошел! Громкость:" << averageVolume;
+                            }
+                        }
+                    });
+                }
+            }
+
+            // Запускаем динамик
+            if (m_audioSink->state() == QAudio::StoppedState) {
+                m_outputDevice = m_audioSink->start();
+            }
+
+            m_socket->write("/voice_enter\n");
+        } else {
+            m_audioSource->stop();
+            m_audioSink->stop();
+            m_socket->write("/voice_leave\n");
+        }
+    });
+    // --- ЛОГИКА КНОПКИ НАУШНИКОВ ---
+    connect(m_headsetButton, &QPushButton::clicked, [this](){
+        m_isDeaf = !m_isDeaf; // Переключаем флаг
+        if (m_isDeaf) {
+            m_headsetButton->setText("🎧 Уши: Выкл");
+            m_audioSink->setVolume(0.0); // Глушим звук на 100%
+        } else {
+            m_headsetButton->setText("🎧 Уши: Вкл");
+            m_audioSink->setVolume(1.0); // Возвращаем громкость на максимум
+        }
+    });
+
+
+
+
+
+    // 3. ЛОГИКА ВХОДА И ВЫХОДА
+    // connect(m_voiceChatButton, &QPushButton::clicked, [this](bool checked){
+    //     if (checked) {
+    //         // --- ВХОД В ГОЛОС ---
+    //         m_voiceChatButton->setText("🛑 Выйти из Голоса");
+    //         m_voiceChatButton->setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;");
+
+    //         m_socket->write("/voice_enter\n");
+
+    //         // Запускаем микрофон и динамик (тот код, что мы писали раньше)
+    //         if (m_audioSource) m_inputDevice = m_audioSource->start();
+    //         if (m_audioSink)   m_outputDevice = m_audioSink->start();
+
+    //         m_chatArea->append("<b style='color:#2ecc71;'>Система: Голосовой канал активирован!</b>");
+    //     } else {
+    //         // --- ВЫХОД ИЗ ГОЛОСА ---
+    //         m_voiceChatButton->setText("🎤 Войти в Голос");
+    //         m_voiceChatButton->setStyleSheet("background-color: #2d3436; color: white; font-weight: bold;");
+
+    //         m_socket->write("/voice_leave\n");
+
+    //         // Стопаем железки
+    //         if (m_audioSource) m_audioSource->stop();
+    //         if (m_audioSink)   m_audioSink->stop();
+
+    //         m_chatArea->append("<b style='color:#e74c3c;'>Система: Вы вышли из голосового канала.</b>");
+    //     }
+    // });
+
+    m_udpSocket = new QUdpSocket(this);
+    // Биндим на тот же порт 1235, чтобы ловить ответ от сервера
+    m_udpSocket->bind(QHostAddress::AnyIPv4, 1235, QUdpSocket::ShareAddress);
+
+    connect(m_udpSocket, &QUdpSocket::readyRead, this, [this](){
+        while (m_udpSocket->hasPendingDatagrams()) {
+            QByteArray data = m_udpSocket->receiveDatagram().data();
+            if (!m_isDeaf && m_outputDevice) {
+                m_outputDevice->write(data); // СРАЗУ В ДИНАМИК
+            }
+        }
+    });
+
+}
 void ChatClient::connectToServer()
 {
     m_socket->connectToHost("83.136.235.45", 1234);
@@ -195,34 +394,34 @@ void ChatClient::stopRecording()
 
 void ChatClient::sendMessage() {
     QString text = m_messageEdit->text().trimmed();
-
     if (text.isEmpty()) return;
 
     if (text.startsWith("/")) {
-
-        m_socket->write(text.toUtf8());
-
-        // m_chatArea->append("<i style='color:gray;'>Отправка команды: " + text + "</i>");
+        m_socket->write((text + "\n").toUtf8()); // Добавляем \n для надежности
     }
     else {
         QString target = m_targetName->text().trimmed();
 
         if (target.isEmpty()) {
-            m_chatArea->append("<b style='color:red;'>Система: Выберите получателя в списке справа!</b>");
+            m_chatArea->append("<b style='color:red;'>Система: Выберите получателя!</b>");
             return;
         }
 
-        QString data = target + ":" + text;
+        // --- КРИТИЧЕСКИЙ ФИКС ДЛЯ ОБЩАКА ---
+        // Если мы выбрали золотой пункт "ОБЩИЙ ЧАТ", маскируем его под GROUP_CHAT
+        if (target == "ОБЩИЙ ЧАТ" || target.contains("ОБЩИЙ ЧАТ")) {
+            target = "GROUP_CHAT";
+        }
+
+        // Формируем данные: "Кому:Текст\n"
+        QString data = target + ":" + text + "\n";
         m_socket->write(data.toUtf8());
 
-        QString time = QDateTime::currentDateTime().toString("hh:mm");
-        //  m_chatArea->append(QString("<span style='color:gray;'>[%1]</span> <b style='color:green;'>Вы:</b> %2")
-        // .arg(time, text));
+        // Очищаем поле ввода сразу после отправки
+        m_messageEdit->clear();
     }
-
-    m_messageEdit->clear();
-    m_chatArea->moveCursor(QTextCursor::End);
 }
+
 QByteArray ChatClient::addWavHeader(QByteArray data) {
     QByteArray header;
     qint32 fileSize = 36 + data.size();
@@ -253,112 +452,151 @@ QByteArray ChatClient::addWavHeader(QByteArray data) {
     return header + data;
 }
 
-void ChatClient::onReadyRead() {
-    static QByteArray buffer;
-    buffer.append(m_socket->readAll());
+void ChatClient::renderTextMessage(const QString &sender, const QString &text, const QString &time)
+{
+    QString myNick = m_myUserName->text().trimmed();
+    QString align = (sender == myNick) ? "right" : "left";
+    QString bgColor = (sender == myNick) ? "#6c5ce7" : "#2d3436";
 
+    m_chatArea->insertHtml(QString(
+                               "<table width=\"100%\"><tr><td align=\"%1\">"
+                               "<div style=\"background-color: %2; color: white; padding: 8px 15px; border-radius: 15px;\">"
+                               "<b style=\"color: #f1c40f;\">%3:</b> %4 <small style=\"color: #bdc3c7;\">%5</small>"
+                               "</div></td></tr></table><br>"
+                               ).arg(align, bgColor, sender, text, time));
+
+    m_chatArea->moveCursor(QTextCursor::End);
+}
+
+void ChatClient::onReadyRead() {
+    // 1. Считываем всё один раз!
+    QByteArray rawData = m_socket->readAll();
+    //if (rawData.isEmpty()) return;
+
+    static QByteArray buffer;
+
+    // 2. ХИРУРГИЯ: Отделяем голос от общего потока байтов
+    if (rawData.contains("VOICE_DATA:")) {
+        int idx = rawData.indexOf("VOICE_DATA:");
+        if (!m_isDeaf && m_outputDevice) {
+            m_outputDevice->write(rawData.mid(idx + 11)); // Шлем в уши
+        }
+        return;
+    }
+    buffer.append(rawData);
+
+    // 3. ТВОЙ ЦИКЛ ОБРАБОТКИ (Файлы и Текст)
     while (buffer.size() > 0) {
         QString myNick = m_myUserName->text().trimmed();
         QString currentTarget = m_targetName->text().trimmed();
 
-        // --- 1. ОБРАБОТКА ФАЙЛОВ И ГОЛОСОВЫХ ---
+        // --- ОБРАБОТКА ФАЙЛОВ И МЕДИА ---
         if (buffer.startsWith("FILE_REC:")) {
             int first = buffer.indexOf(':'), second = buffer.indexOf(':', first + 1);
             int third = buffer.indexOf(':', second + 1), fourth = buffer.indexOf(':', third + 1);
-            if (fourth == -1) return;
+            if (fourth == -1) break;
 
             int fileSize = buffer.mid(third + 1, fourth - third - 1).toInt();
             int headerSize = fourth + 1;
-            if (buffer.size() < (headerSize + fileSize)) return;
+            if (buffer.size() < (headerSize + fileSize)) break;
 
             QString sender = QString::fromUtf8(buffer.mid(first + 1, second - first - 1));
             QString fileName = QString::fromUtf8(buffer.mid(second + 1, third - second - 1));
             QByteArray fileBytes = buffer.mid(headerSize, fileSize);
             buffer.remove(0, headerSize + fileSize);
 
-            // СЧЕТЧИК ДЛЯ МЕДИА [!]
             if (sender != currentTarget && sender != myNick) {
                 m_unreadCounts[sender]++;
                 for(int i = 0; i < m_userListWidget->count(); ++i) {
                     QListWidgetItem* item = m_userListWidget->item(i);
-                    if(item->text().section(" [", 0, 0) == sender) {
-                        item->setBackground(QColor(255, 107, 107));
-                        item->setForeground(Qt::white);
-                        item->setText(QString("%1 [%2]").arg(sender).arg(m_unreadCounts[sender]));
+                    // Извлекаем имя пользователя из текста элемента списка
+                    QString nameInList = item->text().mid(2).section(" [", 0, 0).trimmed();
+
+                    if(nameInList == sender) {
+                        bool isOnline = item->text().startsWith("●");
+                        QString statusPrefix = isOnline ? "● " : "○ ";
+                        item->setBackground(QColor(255, 107, 107)); // Красный фон
+                        item->setForeground(Qt::white);            // Белый текст
+                        item->setText(QString("%1%2 [%3]").arg(statusPrefix, sender).arg(m_unreadCounts[sender]));
                         break;
                     }
                 }
                 continue;
             }
 
-            // Отрисовка медиа
+            // Твоя отрисовка картинок и WAV
             QString align = (sender == myNick) ? "right" : "left";
             QString bgColor = (sender == myNick) ? "#6c5ce7" : "#dfe6e9";
             QImage img;
             if (img.loadFromData(fileBytes)) {
-                QImage scaledImg = img.width() > 500 ? img.scaledToWidth(500, Qt::SmoothTransformation) : img;
+                QImage scaledImg = img.width() > 500 ? img.scaledToWidth(500) : img;
                 QString resName = QString("img_%1").arg(QDateTime::currentMSecsSinceEpoch());
                 m_chatArea->document()->addResource(QTextDocument::ImageResource, QUrl(resName), scaledImg);
                 m_chatArea->insertHtml(QString("<table width='100%'><tr><td align='%1'><div style='background-color: %2; padding: 8px; border-radius: 12px;'><img src='%3' width='350'></div></td></tr></table><br>").arg(align, bgColor, resName));
-            } else if (fileName.endsWith(".wav") || fileName.endsWith(".raw")) {
+            } else if (fileName.endsWith(".wav")) {
                 QString voiceFileName = QString("voice_%1.wav").arg(QDateTime::currentMSecsSinceEpoch());
                 QFile tempFile(voiceFileName);
                 if (tempFile.open(QIODevice::WriteOnly)) { tempFile.write(addWavHeader(fileBytes)); tempFile.close(); }
                 m_chatArea->insertHtml(QString("<div align='%1'><div style='background-color: %2; padding: 10px; border-radius: 12px; color: white;'><b>🎤 Голосовое:</b> <a href='play:%3' style='color: yellow;'>[ ПРОСЛУШАТЬ ]</a></div></div><br>").arg(align, bgColor, voiceFileName));
             }
         }
-        // --- 2. ОБРАБОТКА ТЕКСТА ---
+        // --- ОБРАБОТКА ТЕКСТА ---
         else {
             int lineEnd = buffer.indexOf('\n');
-            if (lineEnd == -1) return;
+            if (lineEnd == -1) break;
 
             QByteArray lineData = buffer.left(lineEnd);
             buffer.remove(0, lineEnd + 1);
             QString message = QString::fromUtf8(lineData).trimmed();
+
+            qDebug() << "SERVER_SAYS:" << message;
+
             if (message.isEmpty()) continue;
 
+            // ОБЩИЙ ЧАТ
+            if (message.startsWith("GROUP_MSG:")) {
+                QString timeStr = message.section(':', 1, 2);
+                QString sender  = message.section(':', 3, 3);
+                QString text    = message.section(':', 4);
+                m_chatArea->insertHtml(QString("<br><b style='color:#f1c40f'>%1:</b> %2 <small>(%3)</small><br>").arg(sender, text, timeStr));
+                continue;
+            }
+
+            // АВТОРИЗАЦИЯ (Твой код)
+            if (message == "AUTH_OK" || message.startsWith("AUTH_OK:")) {
+                m_chatArea->append("<b style='color:#2ecc71;'>Система: Вход выполнен!</b>");
+                m_myUserName->setEnabled(false); m_passwordEdit->setVisible(false);
+                continue;
+            }
+
+            // СПИСОК ЮЗЕРОВ (Твой код)
             if (message.startsWith("USERS_LIST:")) {
-                QString list = message.mid(11);
-                QStringList users = list.split(',', Qt::SkipEmptyParts);
-                QMap<QString, int> oldCounts = m_unreadCounts;
+                QStringList pairs = message.mid(11).split(',', Qt::SkipEmptyParts);
                 m_userListWidget->clear();
-                m_userListWidget->addItems(users);
-                for(int i = 0; i < m_userListWidget->count(); ++i) {
-                    QString name = m_userListWidget->item(i)->text();
-                    if(oldCounts.value(name) > 0) {
-                        QListWidgetItem* item = m_userListWidget->item(i);
-                        item->setBackground(QColor(255, 107, 107));
-                        item->setForeground(Qt::white);
-                        item->setText(QString("%1 [%2]").arg(name).arg(oldCounts[name]));
-                    }
+                QListWidgetItem *groupItem = new QListWidgetItem("📢 [ ОБЩИЙ ЧАТ ]");
+                groupItem->setForeground(QColor("#f1c40f"));
+                m_userListWidget->addItem(groupItem);
+                for (const QString &pair : pairs) {
+                    QString name = pair.section(':', 0, 0);
+                    bool isOnline = pair.section(':', 1, 1) == "1";
+                    QListWidgetItem *item = new QListWidgetItem((isOnline ? "● " : "○ ") + name);
+                    item->setForeground(isOnline ? QColor("#2ecc71") : QColor("#95a5a6"));
+                    m_userListWidget->addItem(item);
                 }
                 continue;
             }
 
+            // ЛИЧНЫЕ СООБЩЕНИЯ
             if (message.contains(": ")) {
                 QString timeStr = message.left(5);
                 QString rest = message.mid(6);
                 QString sender = rest.section(": ", 0, 0).trimmed();
                 QString text = rest.section(": ", 1).trimmed();
 
-                // СЧЕТЧИК ДЛЯ ТЕКСТА [!]
-                if (sender != currentTarget && sender != myNick) {
-                    m_unreadCounts[sender]++;
-                    for(int i = 0; i < m_userListWidget->count(); ++i) {
-                        QListWidgetItem* item = m_userListWidget->item(i);
-                        if(item->text().section(" [", 0, 0) == sender) {
-                            item->setBackground(QColor(255, 107, 107));
-                            item->setForeground(Qt::white);
-                            item->setText(QString("%1 [%2]").arg(sender).arg(m_unreadCounts[sender]));
-                            break;
-                        }
-                    }
-                    continue;
+                if (sender == currentTarget || sender == myNick) {
+                    QString align = (sender == myNick) ? "right" : "left";
+                    m_chatArea->insertHtml(QString("<div align='%1'><b>%2:</b> %3 <small>%4</small></div><br>").arg(align, sender, text, timeStr));
                 }
-
-                QString bgColor = (sender == myNick) ? "#6c5ce7" : "#dfe6e9";
-                QString align = (sender == myNick) ? "right" : "left";
-                m_chatArea->insertHtml(QString("<table width='100%'><tr><td align='%1'><div style='background-color: %2; color: white; padding: 6px 12px; border-radius: 12px;'><b>%3:</b> %4 <span style='font-size: 8px;'>%5</span></div></td></tr></table>").arg(align, bgColor, (sender == myNick ? "Вы" : sender), text, timeStr));
             }
         }
     }

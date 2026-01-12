@@ -16,7 +16,8 @@
 #include <QFile>
 #include <QSoundEffect>
 #include <QTextBrowser>
-
+#include <QAudioSink>
+#include <QUdpSocket>
 
 class ChatClient : public QWidget {
     Q_OBJECT
@@ -42,11 +43,31 @@ private:
     void sendFile(const QString &filePath);
 
     QAudioSource *m_audioSource = nullptr;
+    QAudioSink   *m_audioSink = nullptr;
     QFile m_audioFile;
+
+    QSoundEffect *m_currentPlayer = nullptr;
+    QString m_lastPlayedFile;
     QPushButton *m_micButton;
     void startRecording();
     void stopRecording();
     QByteArray addWavHeader(QByteArray data);
+
+    QLineEdit *m_passwordEdit;
+    QPushButton *connBtn;
+    QPushButton *sendBtn;
+    void renderTextMessage(const QString &sender, const QString &text, const QString &time);
+
+    QIODevice *m_outputDevice = nullptr;
+    QIODevice *m_inputDevice;
+    bool m_isMuted = false;
+    bool m_isDeaf = false;
+    QPushButton *m_voiceButton;
+    QPushButton *m_voiceChatButton;
+    QPushButton *m_headsetButton;
+    int m_voiceThreshold = 3000;
+
+    QUdpSocket *m_udpSocket;
 };
 
 #endif
